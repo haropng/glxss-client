@@ -1,156 +1,97 @@
 import usb.core
 import usb.util
+import pyautogui
+import mss
+import numpy as np
+import cv2
+import time
+import coloredlogs
+import logging
 
-import sys, time
-import coloredlogs, logging
-
+# 配置日志
 logger = logging.getLogger(__name__)
-coloredlogs.install(level='DEBUG')
+coloredlogs.install(level="DEBUG")
 
-fw_path = "G25_MainFW_1.9.2.decrypted.img"
-# fw_path = "G26_PRO_RELEASE_10000051.img"
-
+# 设备信息
 device_vid = 0x2e09
 device_pid = 0x0030
-# device_pid = 0x0041
 
-def load_fw():
-    bootloader_vid = 0x03e7  
-    bootloader_pid = 0x2150
-    dev: usb.core.Device = usb.core.find(idVendor=bootloader_vid, idProduct=bootloader_pid)
-    if dev is None:
-        logger.error("Device not found, please try again")
-    else:
-        logger.info(f"Found Movidius MA2X5X bootloader device at bus {dev.bus} device {dev.address}")
-        dev.set_configuration()
-        with open(fw_path, "rb") as f:
-            data = f.read()
-            fw_size = len(data)
-            logger.info(f"Firmware loaded from path: {fw_path}")
-            start_time = time.time()
-            dev.write(0x01, data)
-            logger.info(f"loaded firmware of {fw_size / 1024:.1f} kiB in {(time.time() - start_time) * 1000:.1f} ms = {(fw_size / 1024) / (time.time() - start_time):.1f} kiB/s")
-            logger.info("Firmware loaded successfully")
+device = None  # 全局设备对象
 
-device: usb.core.Device = None
-
-def wait_for_device(timeout_ms = 5000):
-    logger.info("Waiting for device")
-    start_time = time.time()
-    while True:
-        # check if the vid/pid is correct
-        device = usb.core.find(idVendor=device_vid, idProduct=device_pid)
-        if device is not None:
-            break
-        if time.time() - start_time > timeout_ms / 1000:
-            logger.error("Device not found, please try again")
-            sys.exit(1)
-        time.sleep(0.1)
-    logger.info("Device found")
-
-
+# 打开设备
 def open_device():
     global device
     device = usb.core.find(idVendor=device_vid, idProduct=device_pid)
     if device is None:
-        logger.error("Device not found, please try again")
-    else:
-        logger.info(f"Found device at bus {device.bus} device {device.address}")
-        # device.set_configuration()
+        logger.error("未找到目标设备，请检查连接！")
+        exit(1)
+    logger.info(f"找到设备，Bus: {device.bus}, Address: {device.address}")
+    if device.is_kernel_driver_active(0):
+        logger.info("正在解除内核驱动绑定...")
+        device.detach_kernel_driver(0)
 
+# 获取 LCD 信息
 def lcd_get_info():
-    # do a control transfer to get the LCD info
-    # request type: 0xa1
-    # request: 0x04
-    # value: 0x00
-    # index: 0x03
-    # length: 0x08
-
-    data = device.ctrl_transfer(0xa1, 0x04, 0x00, 0x03, 0x08)
-    # int16_t width;
-    # int16_t height;
-    # int8_t orientation;
-    # int8_t rotation;
-    # int16_t brightness;
-
+    data = device.ctrl_transfer(0xA1, 0x04, 0x00, 0x03, 0x08)
     width = data[0] | (data[1] << 8)
     height = data[2] | (data[3] << 8)
     orientation = data[4]
     rotation = data[5]
     brightness = data[6] | (data[7] << 8)
+    logger.info(f"LCD 信息: 宽度: {width}, 高度: {height}, 方向: {orientation}, 旋转: {rotation}, 亮度: {brightness}")
+    return {"width": width, "height": height, "orientation": orientation, "rotation": rotation, "brightness": brightness}
 
-    # "LCD info: width: %d, height: %d, orientation: %d, rotation: %d, brightness: %d"
-    logger.info(f"LCD info: width: {width}, height: {height}, orientation: {orientation}, rotation: {rotation}, brightness: {brightness}")
-    return {
-        "width": width,
-        "height": height,
-        "orientation": orientation,
-        "rotation": rotation,
-        "brightness": brightness
-    }
-
+# 传输图像到设备
 def lcd_xfer_image(width, height, data):
-    # packet:
-    # int width
-    # int height
-    # uint8_t format = 1
-    # uint8_t fmt_reserved[3] = {0, 0, 0}
-    # uint8_t reserved[8] = {0, 0, 0, 0, 0, 0, 0, 0}
-    # uint8_t data[]
-
     buf = bytearray()
     buf += width.to_bytes(4, byteorder="little")
     buf += height.to_bytes(4, byteorder="little")
-    buf += b"\x01\x00\x00\x00\x00\x00\x00\x00"
+    buf += b"\x01\x00\x00\x00\x00\x00\x00\x00"  # 固定头部
     buf += data
-
-    # bulk transfer to ep1
     device.write(0x01, buf)
+    logger.debug(f"传输图像数据：{len(data)} 字节")
 
-def enable_camera():
-    # do a control transfer to enable the camera
-    # request type: 0x21
-    # request: 0x01
-    # value: 0xd0d
-    # index: ?
-    # data: [0x01]  // enable camera
-    # length: 0x01
-    # for index in range(0x00, 0xff):
-    #     time.sleep(0.5)
-    #     logger.warning(f"Trying index {index}")
-    #     try:
-    #         device.ctrl_transfer(0x21, 0x01, 0xd0d, index, [0x01], 0x01)
-    #         break
-    #     except usb.core.USBError as e:
-    #         logger.error(e)
-            # continue
-    index = 0x0
-    if device.is_kernel_driver_active(0):
-        logger.info("Detaching kernel driver")
-        device.detach_kernel_driver(0)
-        if device.is_kernel_driver_active(0):
-            logger.error("Failed to detach kernel driver")
-            sys.exit(1)
-        else:
-            logger.info("Kernel driver detached")
-    device.ctrl_transfer(0x21, 0x01, 0x606, index, [0x01])
-    device.attach_kernel_driver(0)
+# 捕获屏幕
+def capture_screen():
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]  # 捕获主显示器
+        screenshot = sct.grab(monitor)
+        frame = np.array(screenshot)[:, :, :3]  # 去掉 alpha 通道
+        return frame
 
-import cv2
+# 调整分辨率
+def resize_frame(frame, width, height):
+    return cv2.resize(frame, (width, height))
+
+# 转换为 ARGB8888 格式
+def convert_to_argb8888(frame):
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+
+# 主循环
+def main_loop(lcd_info):
+    width, height = lcd_info["width"], lcd_info["height"]
+    while True:
+        start_time = time.time()
+        try:
+            # 捕获屏幕
+            frame = capture_screen()
+            # 调整分辨率
+            frame = resize_frame(frame, width, height)
+            # 转换为设备支持的格式
+            frame = convert_to_argb8888(frame)
+            # 传输到设备
+            lcd_xfer_image(width, height, frame.tobytes())
+        except Exception as e:
+            logger.error(f"传输失败: {e}")
+            break
+        # 控制帧率
+        time.sleep(max(0, 1 / 30 - (time.time() - start_time)))
+
+# 主函数
 def main():
-    if not usb.core.find(idVendor=device_vid, idProduct=device_pid):
-        load_fw()
-        wait_for_device()
-    open_device()
-    info = lcd_get_info()
-    img = cv2.imread("lena.jpg")
-    # resize the image to the LCD size, and convert to ARGB8888
-    img = cv2.resize(img, (info["width"], info["height"]))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGBA)
-    data = img.tobytes()
-    lcd_xfer_image(info["width"], info["height"], data)
-
-    # enable_camera()
+    open_device()  # 打开设备
+    lcd_info = lcd_get_info()  # 获取 LCD 信息
+    main_loop(lcd_info)  # 启动主循环
 
 if __name__ == "__main__":
     main()
